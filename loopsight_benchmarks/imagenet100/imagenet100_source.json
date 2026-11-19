@@ -1,0 +1,9 @@
+{
+  "dataset": "ImageNet-100",
+  "selection": "CMC 100-class subset",
+  "source_url": "https://raw.githubusercontent.com/HobbitLong/CMC/bc687a26de7ae350d98f671d25d164b65336b8c2/imagenet100.txt",
+  "source_revision": "bc687a26de7ae350d98f671d25d164b65336b8c2",
+  "classes": 100,
+  "label_order": "lexicographically sorted synsets, contiguous 0..99",
+  "retrieved_at_utc": "2026-11-09T12:30:22.377373+00:00"
+}
