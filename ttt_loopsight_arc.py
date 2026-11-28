@@ -30,6 +30,8 @@ def parse_args(argv=None):
     parser.add_argument("--tasks", nargs="+", help="Task IDs; defaults to the entire evaluation set")
     parser.add_argument("--ttt-split", default="eval_color_permute_ttt_9")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--optimize", "--fp32-optimization", action="store_true",
+                        help="Enable CUDA fusion for task adaptation and prediction using the selected precision.")
     output = f"outputs/loopsight_{selected.scale}/ttt/{selected.dataset}"
     parser.set_defaults(
         data_root="raw_data/ARC-AGI" if selected.dataset == "arc1" else "raw_data/ARC-AGI-2",
@@ -55,6 +57,8 @@ def load_model(args, train_dataset, device, distributed, rank, local_rank):
     checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
     validate_task_context_checkpoint(args, checkpoint)
     model = model_from_args(args, train_dataset.num_tasks)
+    if getattr(args, "optimize", False):
+        model.enable_optimization()
     load_task_lowrank_state(model, checkpoint, skip_task_token=True)
     return model.to(device)
 

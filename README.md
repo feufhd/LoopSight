@@ -161,6 +161,43 @@ python visualize_arc.py \
   --output outputs/visualizations/00576224.png
 ```
 
+## Optimized CUDA execution
+
+LoopSight offers opt-in fusion on NVIDIA Ampere and newer CUDA GPUs with
+Triton installed. The training path compiles the normalization and
+conditioning operations with autograd and supports sampled loop depths.
+The FP32 inference path also fuses prediction-memory updates and can
+schedule them alongside the backbone on a second CUDA stream.
+
+Use `--optimize` with either ARC launcher. CUDA offline training and TTT
+adaptation use their regular FP16 AMP and gradient scaling by default.
+Add `--no-amp` for FP32 training. Evaluation and TTT prediction keep
+their usual FP32 execution.
+
+```bash
+bash scripts/train_small.sh --optimize
+bash scripts/ttt_small.sh --dataset arc1 --optimize
+```
+
+To opt in when loading a checkpoint for inference:
+
+```python
+import torch
+from loopsight import load_checkpoint
+
+model, _ = load_checkpoint("outputs/loopsight_small/offline/ema_final.pt", device="cuda")
+model.enable_optimization(inference=True, training=False)
+with torch.inference_mode():
+    logits, metadata = model(pixels, task_ids)
+```
+
+Here `pixels` and `task_ids` are CUDA integer tensors. Small and Medium
+default to two streams, and Large uses a single stream. Set
+`overlap_memory=False` to select single-stream inference. CPU and
+inference under autocast or with intermediate readouts use standard
+execution. The same model weights and checkpoint format work with either
+path.
+
 ## Other benchmarks
 
 Data preparation, training, and evaluation instructions are provided in:

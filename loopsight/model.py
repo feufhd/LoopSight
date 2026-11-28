@@ -67,6 +67,9 @@ class LoopSight(nn.Module):
         self.num_task_tokens = num_task_tokens
         self.max_loop_steps = int(max_loop_steps)
         self.loop_core_depth = loop_core_depth
+        self._optimized_inference = False
+        self._optimized_training = False
+        self._overlap_memory = None
         self.fusion_mode = "task_lowrank_channel"
         self.fusion_gate_rank = fusion_gate_rank
         self.fusion_gate_heads = fusion_gate_heads
@@ -104,6 +107,32 @@ class LoopSight(nn.Module):
             self.fusion_gate = ContextWriteGate(
                 embed_dim, fusion_gate_rank, fusion_gate_logit_bound, fusion_gate_heads,
             )
+
+    def enable_optimization(self, *, inference=True, training=True, overlap_memory=None):
+        """Enable CUDA optimization and leave precision selection to the caller.
+
+        Training fusion supports autocast. The fully fused inference path uses FP32.
+        If overlap_memory is None, the 256- and 384-wide variants use two streams.
+        """
+        self._optimized_inference = inference
+        self._optimized_training = training
+        self._overlap_memory = overlap_memory
+        return self
+
+    enable_fp32_optimization = enable_optimization
+
+    def _can_optimize(self, hidden):
+        return (
+            hidden.is_cuda and hidden.dtype == torch.float32 and torch.version.cuda is not None
+            and torch.cuda.get_device_capability(hidden.device)[0] >= 8
+        )
+
+    @staticmethod
+    def _loop_metadata(hidden, steps):
+        return LoopForwardMetadata(
+            gate_probs=[], max_steps=steps,
+            exit_steps=torch.full((hidden.size(0),), steps, dtype=torch.long, device=hidden.device),
+        )
 
     def _encode_inputs(self, pixel_values, task_ids):
         if pixel_values.ndim != 3 or pixel_values.shape[1:] != (self.image_size, self.image_size):
@@ -167,16 +196,47 @@ class LoopSight(nn.Module):
 
         hidden = self._encode_inputs(pixel_values, task_ids)
         key_padding_mask = self._prepare_attention_mask(attention_mask, pixel_values, hidden.device)
+        steps = int(steps)
+        use_inference = (
+            self._optimized_inference and not self.training and not torch.is_grad_enabled()
+            and not return_intermediates and not return_raw_intermediates and anchor_step is None
+            and not torch.is_autocast_enabled("cuda")
+            and self.embed_dim <= 1024 and self.fusion_gate.rank <= 32
+            and self._can_optimize(hidden)
+        )
+        if use_inference:
+            from ._inference_fp32 import forward_final_fp32
+
+            overlap = self._overlap_memory
+            if overlap is None:
+                overlap = self.embed_dim in (256, 384)
+            logits = forward_final_fp32(
+                self, hidden, key_padding_mask, steps, overlap_memory=overlap and steps > 1,
+            )
+            return logits, self._loop_metadata(hidden, steps)
+
+        fuse_training = (
+            self._optimized_training and self.training and torch.is_grad_enabled()
+            and self._can_optimize(hidden)
+        )
+        layer_options = {"fuse_norm": True} if fuse_training else {}
+        compile_state_norm = fuse_training and type(self.loop_state_norm) is LoopStateRMSNorm
+        if compile_state_norm:
+            from ._training_fusion import state_rms
+
         patch_mask = None if key_padding_mask is None else key_padding_mask[:, self.num_task_tokens:]
         memory = anchor_logits = None
         intermediate_logits, raw_logits = [], []
 
-        for step in range(1, int(steps) + 1):
+        for step in range(1, steps + 1):
             loop_input = hidden
             conditions = self.asymptotic_clock(step)
             for layer, condition in zip(self.core_layers, conditions):
-                hidden = layer(hidden, key_padding_mask=key_padding_mask, condition=condition)
-            hidden = self.loop_state_norm(self._apply_loop_drop_path(loop_input, hidden, step))
+                hidden = layer(
+                    hidden, key_padding_mask=key_padding_mask, condition=condition, **layer_options,
+                )
+            hidden = self._apply_loop_drop_path(loop_input, hidden, step)
+            hidden = state_rms(hidden) if compile_state_norm else self.loop_state_norm(hidden)
 
             projected = self.fusion_projection(hidden).float()
             current = projected[:, self.num_task_tokens:]
@@ -196,10 +256,7 @@ class LoopSight(nn.Module):
             if return_raw_intermediates:
                 raw_logits.append(self._project_to_logits(projected))
 
-        metadata = LoopForwardMetadata(
-            gate_probs=[], max_steps=int(steps),
-            exit_steps=torch.full((hidden.size(0),), int(steps), dtype=torch.long, device=hidden.device),
-        )
+        metadata = self._loop_metadata(hidden, steps)
         if anchor_step is not None:
             return logits, metadata, anchor_logits
         if return_raw_intermediates:

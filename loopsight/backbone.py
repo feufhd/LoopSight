@@ -160,13 +160,24 @@ class ConditionedEncoderLayer(nn.Module):
         nn.init.zeros_(self.time_modulation[-1].weight)
         nn.init.zeros_(self.time_modulation[-1].bias)
 
-    def forward(self, x, key_padding_mask=None, drop_path_rate=0.0, *, condition):
+    def forward(self, x, key_padding_mask=None, drop_path_rate=0.0, *, condition, fuse_norm=False):
         gamma_attn, beta_attn, gamma_ffn, beta_ffn = self.time_modulation(condition).chunk(4, dim=-1)
-        residual = x
-        x = self.norm1(x) * (1 + gamma_attn) + beta_attn
-        x = self.self_attn(x, key_padding_mask=key_padding_mask)
-        x = residual + drop_path(self.dropout1(x), drop_path_rate, self.training)
-        residual = x
-        x = self.norm2(x) * (1 + gamma_ffn) + beta_ffn
-        x = self.mlp(x, grid_size=self.grid_size)
-        return residual + drop_path(self.dropout2(x), drop_path_rate, self.training)
+        if fuse_norm:
+            from ._training_fusion import conditioned_rms, residual_conditioned_rms
+
+            normalized = conditioned_rms(x, self.norm1.scale, gamma_attn, beta_attn, self.norm1.eps)
+        else:
+            normalized = self.norm1(x) * (1 + gamma_attn) + beta_attn
+
+        attention = self.self_attn(normalized, key_padding_mask=key_padding_mask)
+        branch = drop_path(self.dropout1(attention), drop_path_rate, self.training)
+        if fuse_norm:
+            residual, normalized = residual_conditioned_rms(
+                x, branch, self.norm2.scale, gamma_ffn, beta_ffn, self.norm2.eps,
+            )
+        else:
+            residual = x + branch
+            normalized = self.norm2(residual) * (1 + gamma_ffn) + beta_ffn
+
+        output = self.mlp(normalized, grid_size=self.grid_size)
+        return residual + drop_path(self.dropout2(output), drop_path_rate, self.training)

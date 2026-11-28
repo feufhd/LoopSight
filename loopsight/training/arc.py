@@ -90,6 +90,8 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--optimize", "--fp32-optimization", action="store_true",
+                        help="Enable CUDA fusion for ARC training and inference using the selected precision.")
     parser.add_argument("--no-compile", action="store_true", default=True,
                         help="This variable-depth entry point uses eager execution.")
     parser.add_argument("--max-train-batches", type=int, default=None)
@@ -270,7 +272,10 @@ def _resume_if_needed(model, optimizer, scaler, scheduler, args, device, ema=Non
 
 
 def _build_model(args, train_dataset, device, distributed, rank, local_rank):
-    model = enable_checkpointing(model_from_args(args, train_dataset.num_tasks), args).to(device)
+    model = model_from_args(args, train_dataset.num_tasks)
+    if getattr(args, "optimize", False):
+        model.enable_optimization()
+    model = enable_checkpointing(model, args).to(device)
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[device.index] if device.type != "cpu" else None,
